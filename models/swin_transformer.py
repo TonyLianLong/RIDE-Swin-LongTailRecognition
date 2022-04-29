@@ -5,8 +5,12 @@
 # Written by Ze Liu
 # --------------------------------------------------------
 
+# RIDE credit to: https://github.com/frank-xwang/RIDE-LongTailRecognition
+# NormedLinear credit to: https://github.com/kaidic/LDAM-DRW
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
@@ -297,11 +301,11 @@ class PatchMerging(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
+    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm, reduction_out_dim_ratio=2):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.reduction = nn.Linear(4 * dim, int(reduction_out_dim_ratio * dim), bias=False)
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
@@ -359,7 +363,7 @@ class BasicLayer(nn.Module):
 
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False):
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False, reduction_out_dim_ratio=2):
 
         super().__init__()
         self.dim = dim
@@ -381,7 +385,7 @@ class BasicLayer(nn.Module):
 
         # patch merging layer
         if downsample is not None:
-            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer, reduction_out_dim_ratio=reduction_out_dim_ratio)
         else:
             self.downsample = None
 
@@ -454,6 +458,39 @@ class PatchEmbed(nn.Module):
             flops += Ho * Wo * self.embed_dim
         return flops
 
+class NormedLinear(nn.Module):
+
+    def __init__(self, in_features, out_features):
+        super(NormedLinear, self).__init__()
+        self.weight = nn.Parameter(torch.Tensor(in_features, out_features))
+        self.weight.data.uniform_(-1, 1).renorm_(2, 1, 1e-5).mul_(1e5)
+
+    def forward(self, x):
+        out = F.normalize(x, dim=1).mm(F.normalize(self.weight, dim=0))
+        return out
+
+class BranchedLayer(nn.Module):
+    def __init__(self, args, starting_branch=False):
+        super().__init__()
+        # starting branch: 1 input, multiple outputs
+        # other branches: multiple inputs, each passed into the corresponding branch
+        self.starting_branch = starting_branch
+        self.branches = nn.ModuleList(args)
+    
+    def forward(self, args, **kwargs):
+        if len(self.branches) == 1:
+            # No branch detected
+            return self.branches[0](args, **kwargs)
+        
+        # kwargs is passed into all branches the same
+        if not isinstance(args, list): # one input, starting branch
+            return [f(args, **kwargs) for f in self.branches]
+        else: # multiple inputs
+            return [f(args_item, **kwargs) for f, args_item in zip(self.branches, args)]
+    
+    def flops(self):
+        # calculate FLops of all branches
+        return sum([branch.flops() for branch in self.branches])
 
 class SwinTransformer(nn.Module):
     r""" Swin Transformer
@@ -486,7 +523,7 @@ class SwinTransformer(nn.Module):
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, **kwargs):
+                 use_checkpoint=False, use_normed_linear=False, num_experts=1, branching_start=2, force_original_feature_dim=False, force_no_branches=False, **kwargs):
         super().__init__()
 
         self.num_classes = num_classes
@@ -495,6 +532,9 @@ class SwinTransformer(nn.Module):
         self.ape = ape
         self.patch_norm = patch_norm
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.feat_dim_reduction = num_experts > 1 and (not force_original_feature_dim)
+        if self.feat_dim_reduction:
+            self.num_features = int(self.num_features * 3 / 4)
         self.mlp_ratio = mlp_ratio
 
         # split image into non-overlapping patches
@@ -518,7 +558,11 @@ class SwinTransformer(nn.Module):
         # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
+            cur_branch_num = num_experts if i_layer >= branching_start else 1
+            layer_dim = int(embed_dim * 2 ** i_layer)
+            if cur_branch_num > 1 and self.feat_dim_reduction:
+                layer_dim = int(layer_dim * 3 / 4)
+            branches = [BasicLayer(dim=layer_dim,
                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
                                                  patches_resolution[1] // (2 ** i_layer)),
                                depth=depths[i_layer],
@@ -530,17 +574,34 @@ class SwinTransformer(nn.Module):
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                               use_checkpoint=use_checkpoint)
+                               use_checkpoint=use_checkpoint, 
+                               reduction_out_dim_ratio=3/2 if self.feat_dim_reduction and i_layer == (branching_start - 1) else 2
+                            ) for _ in range(cur_branch_num)]
+            if force_no_branches: # force_no_branches is used to remain compatible with original checkpoints
+                assert num_experts == 1
+                layer = branches[0]
+            else:
+                layer = BranchedLayer(branches)
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        if force_no_branches:
+            if use_normed_linear:
+                self.head = NormedLinear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+            else:
+                self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+            self.heads = [self.head] # This is intentionally not a ModuleList to prevent being loaded in state dict
+        else:
+            if use_normed_linear:
+                self.heads = nn.ModuleList([NormedLinear(self.num_features, num_classes) if num_classes > 0 else nn.Identity() for _ in range(num_experts)])
+            else:
+                self.heads = nn.ModuleList([nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity() for _ in range(num_experts)])
 
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
+        if isinstance(m, nn.Linear) or isinstance(m, NormedLinear):
             trunc_normal_(m.weight, std=.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -556,6 +617,12 @@ class SwinTransformer(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
+    def post_process(self, x):
+        x = self.norm(x)  # B L C
+        x = self.avgpool(x.transpose(1, 2))  # B C 1
+        x = torch.flatten(x, 1)
+        return x
+
     def forward_features(self, x):
         x = self.patch_embed(x)
         if self.ape:
@@ -565,15 +632,21 @@ class SwinTransformer(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        x = self.norm(x)  # B L C
-        x = self.avgpool(x.transpose(1, 2))  # B C 1
-        x = torch.flatten(x, 1)
+        if not isinstance(x, list): # Fallback: no branches
+            x = [x]
+        
+        x = [self.post_process(x_item) for x_item in x]
+        
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
-        x = self.head(x)
-        return x
+        x = [head(x_item) for head, x_item in zip(self.heads, x)]
+        
+        if self.training:
+            return x
+        else:
+            return torch.stack(x, dim=1).mean(dim=1)
 
     def flops(self):
         flops = 0

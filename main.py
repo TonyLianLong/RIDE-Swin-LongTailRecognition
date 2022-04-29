@@ -32,6 +32,7 @@ try:
 except ImportError:
     amp = None
 
+from loss_functions import LDAMWithSoftTargetCrossEntropy, RIDELoss
 
 def parse_option():
     parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
@@ -95,13 +96,35 @@ def main(config):
 
     lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
-    if config.AUG.MIXUP > 0.:
+    print("Using loss:", config.TRAIN.LOSS_TYPE)
+    if config.AUG.MIXUP > 0.: # This is the default path
         # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
+        if config.TRAIN.LOSS_TYPE == "RIDE":
+            cls_num_list = np.bincount(np.array(dataset_train.targets))
+            criterion = RIDELoss(cls_num_list, base_diversity_temperature=config.TRAIN.LOSS.BASE_DIV_TEMP, max_m=config.TRAIN.LOSS.MAX_M, s=config.TRAIN.LOSS.S, reweight=config.TRAIN.LOSS.REWEIGHT, reweight_epoch=config.TRAIN.REWEIGHT_EPOCH, base_loss_factor=config.TRAIN.LOSS.BASE_LOSS_FACTOR, additional_diversity_factor=config.TRAIN.LOSS.ADDITIONAL_DIV_FACTOR, reweight_factor=config.TRAIN.LOSS.REWEIGHT_FACTOR)
+            criterion.to("cuda")
+        elif config.TRAIN.LOSS_TYPE == "LDAM":
+            cls_num_list = np.bincount(np.array(dataset_train.targets))
+            
+            def get_ldam_loss(idx):
+                betas = [0, 0.9999]
+                effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+                per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+                per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+                per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(non_blocking=True)
+                criterion = LDAMWithSoftTargetCrossEntropy(cls_num_list=cls_num_list, max_m=0.5, s=30, weight=per_cls_weights).cuda()
+                return criterion
+            criterion_list = [get_ldam_loss(idx) for idx in range(2)]
+        else:
+            criterion = SoftTargetCrossEntropy()
     elif config.MODEL.LABEL_SMOOTHING > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=config.MODEL.LABEL_SMOOTHING)
-    else:
+        assert config.TRAIN.LOSS_TYPE != "RIDE", "RIDE is not implemented with label smoothing but without mixup"
+        assert config.TRAIN.LOSS_TYPE != "LDAM", "LDAM is not implemented with label smoothing but without mixup"
+    elif config.TRAIN.LOSS_TYPE == "CE":
         criterion = torch.nn.CrossEntropyLoss()
+    else:
+        raise ValueError("Unsupported loss type (without mixup or label smoothing): {}".format(config.TRAIN.LOSS_TYPE))
 
     max_accuracy = 0.0
 
@@ -119,7 +142,7 @@ def main(config):
 
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
-        acc1, acc5, loss = validate(config, data_loader_val, model)
+        acc1, acc5, loss = validate(config, data_loader_val, model, data_loader_train)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         if config.EVAL_MODE:
             return
@@ -133,14 +156,23 @@ def main(config):
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
+        if config.TRAIN.LOSS_TYPE == "RIDE":
+            criterion._hook_before_epoch(epoch)
+
+        if config.TRAIN.LOSS_TYPE == "LDAM":
+            idx = 1 if epoch >= config.TRAIN.REWEIGHT_EPOCH else 0
+            criterion = criterion_list[idx]
+
         train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
-
-        acc1, acc5, loss = validate(config, data_loader_val, model)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-        max_accuracy = max(max_accuracy, acc1)
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        
+        if epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1):
+            # Only validate if we save
+            acc1, acc5, loss = validate(config, data_loader_val, model, data_loader_train)
+            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+            max_accuracy = max(max_accuracy, acc1)
+            logger.info(f'Max accuracy: {max_accuracy:.2f}%')
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -161,14 +193,27 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     for idx, (samples, targets) in enumerate(data_loader):
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
+        hard_targets = targets
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
         outputs = model(samples)
 
+        if isinstance(outputs, list):
+            outputs_individual = torch.stack(outputs, dim=0)
+            outputs = outputs_individual.mean(dim=0)
+        else:
+            outputs_individual = None
+
         if config.TRAIN.ACCUMULATION_STEPS > 1:
-            loss = criterion(outputs, targets)
+            if config.TRAIN.LOSS_TYPE == "RIDE":
+                loss = criterion(outputs, hard_targets, soft_target=targets, outputs_individual=outputs_individual)
+            elif config.TRAIN.LOSS_TYPE == "LDAM":
+                loss = criterion(outputs, hard_targets, soft_target=targets)
+            else:
+                loss = criterion(outputs, targets)
+            
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
             if config.AMP_OPT_LEVEL != "O0":
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -188,7 +233,13 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 optimizer.zero_grad()
                 lr_scheduler.step_update(epoch * num_steps + idx)
         else:
-            loss = criterion(outputs, targets)
+            if config.TRAIN.LOSS_TYPE == "RIDE":
+                loss = criterion(outputs, hard_targets, soft_target=targets, outputs_individual=outputs_individual)
+            elif config.TRAIN.LOSS_TYPE == "LDAM":
+                loss = criterion(outputs, hard_targets, soft_target=targets)
+            else:
+                loss = criterion(outputs, targets)
+            
             optimizer.zero_grad()
             if config.AMP_OPT_LEVEL != "O0":
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -229,9 +280,19 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
 
 @torch.no_grad()
-def validate(config, data_loader, model):
+def validate(config, data_loader, model, data_loader_train=None):
     criterion = torch.nn.CrossEntropyLoss()
     model.eval()
+
+    if data_loader_train is not None:
+        train_cls_num_list = np.bincount(data_loader_train.dataset.targets)
+        # Definition of Many, Medium, Few: https://github.com/zhmiao/OpenLongTailRecognition-OLTR/blob/f50e375f123fd12dd0ae39e07aa226fadec32f33/utils.py#L52
+        many_shot = train_cls_num_list >= 100
+        medium_shot = (train_cls_num_list < 100) & (train_cls_num_list > 20)
+        few_shot = train_cls_num_list <= 20
+
+        num_classes = len(train_cls_num_list)
+        confusion_matrix = torch.zeros(num_classes, num_classes).cuda()
 
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
@@ -258,6 +319,10 @@ def validate(config, data_loader, model):
         acc1_meter.update(acc1.item(), target.size(0))
         acc5_meter.update(acc5.item(), target.size(0))
 
+        if data_loader_train is not None:
+            for t, p in zip(target.view(-1), output.argmax(dim=1).view(-1)):
+                confusion_matrix[t.long(), p.long()] += 1
+
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
@@ -271,7 +336,18 @@ def validate(config, data_loader, model):
                 f'Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
                 f'Acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t'
                 f'Mem {memory_used:.0f}MB')
-    logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
+    
+    if data_loader_train is not None:
+        # This is the formula in OLTR which defines Many/Medium/Few split on ImageNet-LT.
+        acc_per_class = confusion_matrix.diag()/confusion_matrix.sum(1)
+        acc = acc_per_class.cpu().numpy()
+        many_shot_acc = acc[many_shot].mean() * 100
+        medium_shot_acc = acc[medium_shot].mean() * 100
+        few_shot_acc = acc[few_shot].mean() * 100
+
+        logger.info(f' * Acc@1 {acc1_meter.avg:.3f} (Many {many_shot_acc:.3f} Medium {medium_shot_acc:.3f} Few {few_shot_acc:.3f}) Acc@5 {acc5_meter.avg:.3f}')
+    else:
+        logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
     return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
 
 
@@ -332,10 +408,11 @@ if __name__ == '__main__':
     config.TRAIN.MIN_LR = linear_scaled_min_lr
     config.freeze()
 
-    os.makedirs(config.OUTPUT, exist_ok=True)
-    logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
+    if not config.EVAL_MODE:
+        os.makedirs(config.OUTPUT, exist_ok=True)
+    logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}", log_file=not config.EVAL_MODE)
 
-    if dist.get_rank() == 0:
+    if (dist.get_rank() == 0) and not config.EVAL_MODE:
         path = os.path.join(config.OUTPUT, "config.json")
         with open(path, "w") as f:
             f.write(config.dump())

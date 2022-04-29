@@ -1,0 +1,25 @@
+# LDAM: LOSS_TYPE and USE_NORMED_LINEAR
+
+MODEL:
+  TYPE: swin
+  NAME: swin_tiny_patch4_window7_224_lt_ride_2_experts
+  DROP_PATH_RATE: 0.2
+  SWIN:
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 6, 2 ]
+    NUM_HEADS: [ 3, 6, 12, 24 ]
+    WINDOW_SIZE: 7
+  USE_NORMED_LINEAR: true
+  BRANCHING_START: 2
+  NUM_EXPERTS: 2
+TRAIN:
+  LOSS_TYPE: RIDE
+  REWEIGHT_EPOCH: 240
+  LOSS:
+    REWEIGHT_FACTOR: 0.02
+  WEIGHT_DECAY: 0.2
+DATA:
+  DATASET: "imagenet-lt"
+  DATA_PATH: "./dataset/ImageNet_LT"
+  NUM_WORKERS: 16
+SAVE_FREQ: 100

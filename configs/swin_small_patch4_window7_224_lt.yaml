@@ -1,12 +1,18 @@
+# LDAM: LOSS_TYPE and USE_NORMED_LINEAR
+
 MODEL:
   TYPE: swin
-  NAME: swin_small_patch4_window7_224
+  NAME: swin_small_patch4_window7_224_lt_ldam
   DROP_PATH_RATE: 0.3
   SWIN:
     EMBED_DIM: 96
     DEPTHS: [ 2, 2, 18, 2 ]
     NUM_HEADS: [ 3, 6, 12, 24 ]
     WINDOW_SIZE: 7
+  USE_NORMED_LINEAR: true
+TRAIN:
+  LOSS_TYPE: LDAM
+  REWEIGHT_EPOCH: 240
 DATA:
   DATASET: "imagenet-lt"
   DATA_PATH: "./dataset/ImageNet_LT"

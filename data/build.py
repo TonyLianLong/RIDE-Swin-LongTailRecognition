@@ -14,7 +14,7 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import Mixup
 from timm.data import create_transform
 from timm.data.transforms import _pil_interp
-
+from .lt_dataset import LT_Dataset
 from .cached_image_folder import CachedImageFolder
 from .samplers import SubsetRandomSampler
 
@@ -81,6 +81,13 @@ def build_dataset(is_train, config):
         else:
             root = os.path.join(config.DATA.DATA_PATH, prefix)
             dataset = datasets.ImageFolder(root, transform=transform)
+        nb_classes = 1000
+    elif config.DATA.DATASET == 'imagenet-lt':
+        root = config.DATA.DATA_PATH
+        # Note that we use test set instead of validation set
+        prefix = 'train' if is_train else 'test'
+        txt = "ImageNet_LT_{}.txt".format(prefix)
+        dataset = LT_Dataset(root, os.path.join(root, txt), transform=transform)
         nb_classes = 1000
     else:
         raise NotImplementedError("We only support ImageNet Now.")

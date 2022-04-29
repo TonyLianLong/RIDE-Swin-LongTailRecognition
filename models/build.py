@@ -27,8 +27,15 @@ def build_model(config):
                                 drop_path_rate=config.MODEL.DROP_PATH_RATE,
                                 ape=config.MODEL.SWIN.APE,
                                 patch_norm=config.MODEL.SWIN.PATCH_NORM,
-                                use_checkpoint=config.TRAIN.USE_CHECKPOINT)
+                                use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+                                use_normed_linear=config.MODEL.USE_NORMED_LINEAR,
+                                num_experts=config.MODEL.NUM_EXPERTS,
+                                branching_start=config.MODEL.BRANCHING_START,
+                                force_original_feature_dim=config.MODEL.FORCE_ORIGINAL_FEATURE_DIM,
+                                force_no_branches=config.MODEL.FORCE_NO_BRANCHES)
     elif model_type == 'swin_mlp':
+        # use_normed_linear is not supported
+        assert not config.MODEL.USE_NORMED_LINEAR
         model = SwinMLP(img_size=config.DATA.IMG_SIZE,
                         patch_size=config.MODEL.SWIN_MLP.PATCH_SIZE,
                         in_chans=config.MODEL.SWIN_MLP.IN_CHANS,
